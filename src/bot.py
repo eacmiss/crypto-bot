@@ -1,4 +1,5 @@
 import os
+import asyncio
 import requests
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -8,7 +9,7 @@ load_dotenv()
 
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 OPENSEA_API = "https://api.opensea.io/api/v2"
-GAS_API = "https://api.etherscan.io/api"
+ETH_RPC = "https://eth.llamarpc.com"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
@@ -73,27 +74,29 @@ async def get_gas_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     
     try:
-        # Using free gas API
-        response = requests.get("https://ethgasstation.info/api/ethgasAPI.json?api-key=free")
-        if response.status_code == 200:
-            data = response.json()
-            
-            gas_text = "⛽ Current Gas Prices (Gwei)\n\n"
-            gas_text += f"🐢 Slow: {data.get('safeLow', 'N/A')} gwei\n"
-            gas_text += f"⚡ Average: {data.get('average', 'N/A')} gwei\n"
-            gas_text += f"🚀 Fast: {data.get('fast', 'N/A')} gwei\n"
-            gas_text += f"⚡⚡ Fastest: {data.get('fastest', 'N/A')} gwei\n\n"
-            
-            # Estimate costs
-            safe_low = data.get('safeLow', 20) / 10
-            gas_text += f"💰 Estimated ETH Transfer Cost:\n"
-            gas_text += f"• Slow: ~${safe_low * 0.002:.2f}\n"
-            gas_text += f"• Average: ~${data.get('average', 25) / 10 * 0.002:.2f}\n"
-            gas_text += f"• Fast: ~${data.get('fast', 30) / 10 * 0.002:.2f}"
-        else:
-            gas_text = "⚠️ Unable to fetch gas prices. Please try again later."
-    except Exception as e:
-        gas_text = f"⚠️ Error fetching gas prices: {str(e)}"
+        def fetch_gas():
+            rpc = requests.post(
+                ETH_RPC,
+                json={"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1},
+                timeout=10,
+            ).json()
+            gas_wei = int(rpc["result"], 16)
+            price = requests.get(
+                f"{COINGECKO_API}/simple/price?ids=ethereum&vs_currencies=usd",
+                timeout=10,
+            ).json()
+            return gas_wei, price["ethereum"]["usd"]
+
+        gas_wei, eth_usd = await asyncio.to_thread(fetch_gas)
+        gas_gwei = gas_wei / 1e9
+        transfer_eth = gas_wei * 21000 / 1e18
+
+        gas_text = "⛽ Current Gas Price\n\n"
+        gas_text += f"⚡ {gas_gwei:.1f} gwei\n\n"
+        gas_text += f"💰 Estimated ETH Transfer Cost (21,000 gas):\n"
+        gas_text += f"• {transfer_eth:.6f} ETH (~${transfer_eth * eth_usd:.2f})"
+    except Exception:
+        gas_text = "⚠️ Unable to fetch gas prices. Please try again later."
     
     keyboard = [
         [InlineKeyboardButton("🔄 Refresh", callback_data="gas_prices")],
@@ -108,7 +111,11 @@ async def get_top_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     
     try:
-        response = requests.get(f"{COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1&sparkline=false")
+        response = await asyncio.to_thread(
+            requests.get,
+            f"{COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1&sparkline=false",
+            timeout=10,
+        )
         if response.status_code == 200:
             data = response.json()
             
@@ -136,7 +143,11 @@ async def handle_token_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE
     token_symbol = update.message.text.upper().strip()
     
     try:
-        response = requests.get(f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={token_symbol.lower()}")
+        response = await asyncio.to_thread(
+            requests.get,
+            f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={token_symbol.lower()}",
+            timeout=10,
+        )
         
         if response.status_code == 200:
             data = response.json()
@@ -157,14 +168,20 @@ async def handle_token_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE
                 text += f"🏆 Rank: #{coin['market_cap_rank'] or 'N/A'}"
             else:
                 # Try search by symbol
-                search_response = requests.get(f"{COINGECKO_API}/coins/list")
+                search_response = await asyncio.to_thread(
+                    requests.get, f"{COINGECKO_API}/coins/list", timeout=15
+                )
                 if search_response.status_code == 200:
                     coins_list = search_response.json()
                     matching_coins = [c for c in coins_list if c['symbol'].upper() == token_symbol]
                     
                     if matching_coins:
                         coin_id = matching_coins[0]['id']
-                        detail_response = requests.get(f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={coin_id}")
+                        detail_response = await asyncio.to_thread(
+                            requests.get,
+                            f"{COINGECKO_API}/coins/markets?vs_currency=usd&ids={coin_id}",
+                            timeout=10,
+                        )
                         if detail_response.status_code == 200:
                             detail_data = detail_response.json()
                             if detail_data:
@@ -204,9 +221,11 @@ async def handle_nft_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Accept": "application/json"
         }
         
-        response = requests.get(
+        response = await asyncio.to_thread(
+            requests.get,
             f"{OPENSEA_API}/collections/{collection_slug}",
-            headers=headers
+            headers=headers,
+            timeout=10,
         )
         
         if response.status_code == 200:
@@ -219,6 +238,9 @@ async def handle_nft_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"🔗 Owners: {collection.get('owner_count', 'N/A')}\n"
             text += f"📈 24h Volume: {collection.get('one_day_volume', 'N/A')}\n\n"
             text += f"📝 Description: {collection.get('description', 'N/A')[:200]}..."
+        elif response.status_code in (401, 403):
+            text = "⚠️ OpenSea API requires an API key.\n\n"
+            text += "Get a free key at opensea.io and set OPENSEA_API_KEY in env vars."
         else:
             text = f"⚠️ Collection '{collection_slug}' not found.\n\n"
             text += "Try: bored-ape-yacht-club, azuki, doodles-official, moonbirds"
